@@ -93,7 +93,7 @@ with col_chat:
         
         try:
             genai.configure(api_key=chiave_finale)
-            model_llm = genai.GenerativeModel('gemini-2.0-flash')
+            model_llm = genai.GenerativeModel('gemini-2.5-flash')
             prompt_xai = f"Sei un esperto di econometria. Risultati: Driver={active_features}, Target={target}, m_hat={factors}. Spiega all'utente: {prompt_utente}"
             
             with st.spinner("L'IA sta elaborando i dati..."):
