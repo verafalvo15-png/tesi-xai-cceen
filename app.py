@@ -1,109 +1,124 @@
 import streamlit as st
-import numpy as np
 import pandas as pd
-from sklearn.linear_model import ElasticNet, LinearRegression
+import numpy as np
+from sklearn.linear_model import ElasticNetCV, LinearRegression
 import google.generativeai as genai
+import plotly.express as px
 
-# --- 1. CONFIGURAZIONE PAGINA E UI ---
-st.set_page_config(page_title="XAI CCE-ElasticNet", page_icon="🤖")
-st.title("📊 Chatbot XAI: CCE-Elastic Net")
-st.markdown("Interroga i risultati del modello econometrico in linguaggio naturale.")
+# --- SETUP PAGINA ---
+st.set_page_config(page_title="Tesi Saveria Falvo - Dashboard XAI", layout="wide")
+st.title("📊 Framework Econometrico: CCE-Elastic Net")
+st.caption("Analisi empirica su dataset FRED-MD - Allineato allo sviluppo in R")
 
-# --- 2. MOTORE ECONOMETRICO (Eseguito una sola volta grazie alla cache) ---
+# --- MOTORE ECONOMETRICO (Versione Robusta) ---
 @st.cache_data
-def esegui_stima_cce_en():
-    np.random.seed(42)
-    N, T, K = 50, 30, 20
-    f_t = np.random.normal(0, 1, T)
-    data = []
-    for i in range(N):
-        gamma_i = np.random.uniform(0.5, 1.5)
-        lambda_i = np.random.uniform(0.2, 0.8, K)
-        for t in range(T):
-            X_it = lambda_i * f_t[t] + np.random.normal(0, 1, K)
-            # Veri driver: X1, X2, X3
-            y_it = 2.0*X_it[0] - 1.5*X_it[1] + 1.0*X_it[2] + gamma_i*f_t[t] + np.random.normal(0, 0.5)
-            data.append([i, t, y_it] + list(X_it))
+def esegui_stima_empirica():
+    try:
+        # 1. Caricamento Dati: saltiamo la riga 2 (trasformazioni)
+        df = pd.read_csv("current.csv")
+        # Rimuoviamo la riga delle trasformazioni (la riga 0 dopo il caricamento)
+        df = df.drop(0).reset_index(drop=True)
+        
+        # Pulizia colonna temporale
+        df = df.rename(columns={df.columns[0]: 'time'})
+        df = df.dropna(subset=['time'])
+        
+        # Selezione Target (INDPRO)
+        y_target = 'INDPRO'
+        
+        # Teniamo solo colonne numeriche e rimuoviamo quelle con troppi NaN
+        df_numeric = df.select_dtypes(include=[np.number]).dropna(axis=1, thresh=int(0.8 * len(df)))
+        # Riempimento buchi (Imputation)
+        df_numeric = df_numeric.ffill().bfill()
+        
+        if y_target not in df_numeric.columns:
+            return f"Errore: Variabile {y_target} non trovata nel dataset.", None, None, None, None
 
-    cols = ['id', 'time', 'y'] + [f'X_{k+1}' for k in range(K)]
-    df = pd.DataFrame(data, columns=cols)
+        Y = df_numeric[[y_target]].values
+        X = df_numeric.drop(columns=[y_target]).values
+        feature_names = df_numeric.drop(columns=[y_target]).columns.tolist()
+        
+        T_obs, K_vars = X.shape
 
-    z_bar = df.groupby('time').mean().drop(columns=['id'])
-    z_bar.columns = [f'{col}_bar' for col in z_bar.columns]
-    df = df.merge(z_bar, on='time')
+        # 2. PCA PER FATTORI COMUNI (Metodo R)
+        # Standardizzazione (Fondamentale per PCA)
+        X_std = (X - X.mean(axis=0)) / X.std(axis=0)
+        Sigma_T = (1/T_obs) * (X_std @ X_std.T)
+        eigenvalues, eigenvectors = np.linalg.eigh(Sigma_T)
+        
+        eigenvalues = eigenvalues[::-1]
+        eigenvectors = eigenvectors[:, ::-1]
+        
+        # Soglia 5% autovalore principale
+        m_hat = int(np.sum(eigenvalues >= (0.05 * eigenvalues[0])))
+        if m_hat == 0: m_hat = 1
 
-    def partial_out(target_col, z_cols, data):
-        reg = LinearRegression().fit(data[z_cols], data[target_col])
-        return data[target_col] - reg.predict(data[z_cols])
+        # 3. PROIEZIONE ORTOGONALE M_hat
+        F_hat = eigenvectors[:, :m_hat]
+        I_T = np.eye(T_obs)
+        M_hat = I_T - F_hat @ np.linalg.inv(F_hat.T @ F_hat) @ F_hat.T
+        
+        # Purificazione
+        Y_proj = M_hat @ Y
+        X_proj = M_hat @ X
 
-    z_columns = [col for col in df.columns if '_bar' in col]
-    df['y_tilde'] = partial_out('y', z_columns, df)
-    X_cols = [f'X_{k+1}' for k in range(K)]
-    for x_col in X_cols:
-        df[f'{x_col}_tilde'] = partial_out(x_col, z_columns, df)
+        # 4. ELASTIC NET CV
+        model = ElasticNetCV(l1_ratio=[.1, .5, .7, .9, .95, .99, 1], cv=5, max_iter=2000)
+        model.fit(X_proj, Y_proj.ravel())
 
-    X_tilde_cols = [f'{x_col}_tilde' for x_col in X_cols]
-    enet = ElasticNet(alpha=0.1, l1_ratio=0.5, fit_intercept=False)
-    enet.fit(df[X_tilde_cols], df['y_tilde'])
+        coeffs = {feature_names[i]: round(model.coef_[i], 5) for i in range(K_vars) if abs(model.coef_[i]) > 1e-4}
+        
+        return coeffs, y_target, m_hat, model.l1_ratio_, model.alpha_
 
-    coeff_dict = {X_cols[i]: round(enet.coef_[i], 3) for i in range(K)}
-    return {k: v for k, v in coeff_dict.items() if v != 0.0}
+    except Exception as e:
+        return f"Errore tecnico: {str(e)}", None, None, None, None
 
-active_features = esegui_stima_cce_en()
+# Esecuzione
+active_features, target, factors, opt_alpha, opt_lambda = esegui_stima_empirica()
 
-# --- 3. SIDEBAR (Per la sicurezza e i dettagli tecnici) ---
-with st.sidebar:
-    st.header("⚙️ Impostazioni")
-    # Inserimento chiave API sicuro (non rimane salvata nel codice!)
-    api_key = st.text_input("Inserisci la tua API Key di Gemini:", type="password")
+# --- INTERFACCIA ---
+col_stats, col_chat = st.columns([1, 1], gap="large")
 
-    st.divider()
-    st.subheader("📈 Risultati CCE-Elastic Net")
-    st.caption("Variabili purificate dai fattori comuni:")
-    st.json(active_features)
+with col_stats:
+    st.subheader("📈 Risultati della Stima")
+    if isinstance(active_features, dict):
+        st.write(f"**Variabile Target:** {target}")
+        st.metric("Fattori comuni (m_hat)", factors)
+        
+        if active_features:
+            df_plot = pd.DataFrame({
+                'Variabile': list(active_features.keys()),
+                'Coefficiente': list(active_features.values())
+            }).sort_values(by='Coefficiente')
+            
+            fig = px.bar(df_plot, x='Coefficiente', y='Variabile', orientation='h',
+                         color='Coefficiente', color_continuous_scale='RdBu_r',
+                         title="Impatto dei Driver (Purificati CCE)")
+            st.plotly_chart(fig, use_container_width=True)
+        else:
+            st.warning("Nessuna variabile selezionata dall'Elastic Net con i parametri attuali.")
+    else:
+        st.error(active_features)
 
-# --- 4. LOGICA CHATBOT LLM ---
-if "messages" not in st.session_state:
-    # Messaggio di benvenuto iniziale
-    st.session_state.messages = [{"role": "assistant", "content": "Ciao! Ho analizzato i dati con il modello CCE-Elastic Net purificandoli dai fattori comuni. Chiedimi pure cosa vuoi sapere sulla performance aziendale!"}]
-
-# Mostra lo storico della chat
-for msg in st.session_state.messages:
-    st.chat_message(msg["role"]).write(msg["content"])
-
-# --- 5. INTERAZIONE UTENTE ---
-if prompt_utente := st.chat_input("Chiedi qualcosa (es. 'Qual è la variabile più importante?')"):
-
-    # 1. Stampa il messaggio dell'utente a schermo
-    st.chat_message("user").write(prompt_utente)
-    st.session_state.messages.append({"role": "user", "content": prompt_utente})
-
-    # 2. Controllo API Key
-    if not api_key:
-        st.error("AIzaSyCx7mzeTZQJb1Kvd8GAwcaDetsimLTvQSo")
-        st.stop()
-
-    # 3. Costruzione del Contesto "Nascosto" per l'IA
-    contesto_sistema = f"""
-    Sei un assistente XAI (Explainable AI). Hai appena stimato un modello CCE-Elastic Net
-    su dati panel. I risultati (al netto degli shock globali non osservati) indicano che
-    solo queste variabili hanno un impatto: {active_features}.
-    Tutte le altre 17 variabili sono irrilevanti (coefficiente 0).
-    Rispondi in modo professionale ma comprensibile, basandoti SOLO su questi numeri.
-    L'utente chiede: {prompt_utente}
-    """
-
-    # 4. Chiamata a Gemini
-    genai.configure(api_key=api_key)
-    model = genai.GenerativeModel('gemini-2.5-flash')
-
-    with st.spinner("Sto analizzando i dati econometrici..."):
-        try:
-            risposta = model.generate_content(contesto_sistema)
-            testo_risposta = risposta.text
-
-            # Stampa la risposta del bot e salvala nello storico
-            st.chat_message("assistant").write(testo_risposta)
-            st.session_state.messages.append({"role": "assistant", "content": testo_risposta})
-        except Exception as e:
-            st.error(f"Errore API: {e}")
+with col_chat:
+    st.subheader("🤖 Chatbot XAI")
+    # (Codice Chatbot identico al precedente...)
+    if "messages" not in st.session_state:
+        st.session_state.messages = [{"role": "assistant", "content": "Analisi completata. Chiedimi pure spiegazioni sui driver macroeconomici!"}]
+    for msg in st.session_state.messages:
+        st.chat_message(msg["role"]).write(msg["content"])
+    
+    if p_utente := st.chat_input("Spiegami i risultati..."):
+        st.chat_message("user").write(p_utente)
+        st.session_state.messages.append({"role": "user", "content": p_utente})
+        api_key = st.sidebar.text_input("Gemini API Key", type="password")
+        if not api_key:
+            st.warning("Inserisci l'API Key nella barra laterale!")
+            st.stop()
+        genai.configure(api_key=api_key)
+        model_llm = genai.GenerativeModel('gemini-2.0-flash')
+        prompt = f"Sei un esperto XAI. Target: {target}, Fattori: {factors}, Driver: {active_features}. Spiega all'utente: {p_utente}"
+        with st.spinner("Pensando..."):
+            res = model_llm.generate_content(prompt)
+            st.chat_message("assistant").write(res.text)
+            st.session_state.messages.append({"role": "assistant", "content": res.text})
